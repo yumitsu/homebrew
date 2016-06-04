@@ -1,4 +1,4 @@
-require "cmd/tap"
+require "tap"
 
 module Homebrew
   def tap_info
@@ -6,7 +6,7 @@ module Homebrew
       taps = Tap
     else
       taps = ARGV.named.map do |name|
-        Tap.fetch(*tap_args(name))
+        Tap.fetch(name)
       end
     end
 

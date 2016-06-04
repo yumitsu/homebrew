@@ -3,41 +3,65 @@ require "cmd/config"
 require "net/http"
 require "net/https"
 require "stringio"
+require "socket"
 
 module Homebrew
   def gistify_logs(f)
     files = load_logs(f.logs)
+    build_time = f.logs.ctime
+    timestamp = build_time.strftime("%Y-%m-%d_%H-%M-%S")
 
     s = StringIO.new
     Homebrew.dump_verbose_config(s)
-    files["config.out"] = { :content => s.string }
-    files["doctor.out"] = { :content => `brew doctor 2>&1` }
+    # Dummy summary file, asciibetically first, to control display title of gist
+    files["# #{f.name} - #{timestamp}.txt"] = { :content => brief_build_info(f) }
+    files["00.config.out"] = { :content => s.string }
+    files["00.doctor.out"] = { :content => `brew doctor 2>&1` }
     unless f.core_formula?
       tap = <<-EOS.undent
         Formula: #{f.name}
         Tap: #{f.tap}
         Path: #{f.path}
       EOS
-      files["tap.out"] = { :content => tap }
+      files["00.tap.out"] = { :content => tap }
     end
 
-    url = create_gist(files)
+    # Description formatted to work well as page title when viewing gist
+    if f.core_formula?
+      descr = "#{f.name} on #{OS_VERSION} - Homebrew build logs"
+    else
+      descr = "#{f.name} (#{f.full_name}) on #{OS_VERSION} - Homebrew build logs"
+    end
+    url = create_gist(files, descr)
 
     if ARGV.include?("--new-issue") || ARGV.switch?("n")
       auth = :AUTH_TOKEN
 
-      unless HOMEBREW_GITHUB_API_TOKEN
+      if GitHub.api_credentials_type == :none
         puts "You can create a personal access token: https://github.com/settings/tokens"
         puts "and then set HOMEBREW_GITHUB_API_TOKEN as authentication method."
         puts
 
-        auth = :AUTH_BASIC
+        auth = :AUTH_USER_LOGIN
       end
 
       url = new_issue(f.tap, "#{f.name} failed to build on #{MacOS.full_version}", url, auth)
     end
 
     puts url if url
+  end
+
+  def brief_build_info(f)
+    build_time_str = f.logs.ctime.strftime("%Y-%m-%d %H:%M:%S")
+    s = <<-EOS.undent
+      Homebrew build logs for #{f.full_name} on #{OS_VERSION}
+    EOS
+    if ARGV.include?("--with-hostname")
+      hostname = Socket.gethostname
+      s << "Host: #{hostname}\n"
+    end
+    s << "Build date: #{build_time_str}\n"
+    s
   end
 
   # Hack for ruby < 1.9.3
@@ -68,8 +92,8 @@ module Homebrew
     logs
   end
 
-  def create_gist(files)
-    post("/gists", "public" => true, "files" => files)["html_url"]
+  def create_gist(files, descr)
+    post("/gists", { "public" => true, "files" => files, "description" => descr })["html_url"]
   end
 
   def new_issue(repo, title, body, auth)
@@ -91,19 +115,24 @@ module Homebrew
   end
 
   def make_request(path, data, auth)
-    headers = {
-      "User-Agent"   => HOMEBREW_USER_AGENT,
-      "Accept"       => "application/vnd.github.v3+json",
-      "Content-Type" => "application/json"
-    }
+    headers = GitHub.api_headers
+    headers["Content-Type"] = "application/json"
 
-    if auth == :AUTH_TOKEN || (auth.nil? && HOMEBREW_GITHUB_API_TOKEN)
-      headers["Authorization"] = "token #{HOMEBREW_GITHUB_API_TOKEN}"
+    basic_auth_credentials = nil
+    if auth != :AUTH_USER_LOGIN
+      token, username = GitHub.api_credentials
+      case GitHub.api_credentials_type
+      when :keychain
+        basic_auth_credentials = [username, token]
+      when :environment
+        headers["Authorization"] = "token #{token}"
+      end
     end
 
     request = Net::HTTP::Post.new(path, headers)
+    request.basic_auth(*basic_auth_credentials) if basic_auth_credentials
 
-    login(request) if auth == :AUTH_BASIC
+    login(request) if auth == :AUTH_USER_LOGIN
 
     request.body = Utils::JSON.dump(data)
     request
@@ -116,6 +145,7 @@ module Homebrew
     when Net::HTTPCreated
       Utils::JSON.load get_body(response)
     else
+      GitHub.api_credentials_error_message(response)
       raise "HTTP #{response.code} #{response.message} (expected 201)"
     end
   end
